@@ -19,10 +19,13 @@
 
 extern alias ProtobufNet;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
 using Google.Protobuf;
@@ -181,38 +184,53 @@ namespace Confluent.SchemaRegistry.Serdes
             }
         }
 
-
         /// <remarks>
         ///     note: protobuf does not support circular file references, so this possibility isn't considered.
         /// </remarks>
-        private async Task<List<SchemaReference>> RegisterOrGetReferences(FileDescriptor fd, SerializationContext context, bool autoRegisterSchema, bool skipKnownTypes)
+        private async Task<List<SchemaReference>> RegisterOrGetReferences(FileDescriptor fd, SerializationContext context, bool autoRegisterSchema, bool skipKnownTypes, ConcurrentDictionary<string, Lazy<Task<SchemaReference>>> cache)
         {
             var tasks = new List<Task<SchemaReference>>();
-            for (int i=0; i<fd.Dependencies.Count; ++i)
-            {
-                FileDescriptor fileDescriptor = fd.Dependencies[i];
-                if (skipKnownTypes && IgnoreReference(fileDescriptor.Name))
-                {
-                    continue;
-                }
-                
-                Func<FileDescriptor, Task<SchemaReference>> t = async (dependency) => {
-                    var dependencyReferences = await RegisterOrGetReferences(dependency, context, autoRegisterSchema, skipKnownTypes).ConfigureAwait(continueOnCapturedContext: false);
-                    var subject = referenceSubjectNameStrategy(context, dependency.Name);
-                    var schema = new Schema(dependency.SerializedData.ToBase64(), dependencyReferences, SchemaType.Protobuf);
-                    var schemaId = autoRegisterSchema
-                        ? await schemaRegistryClient.RegisterSchemaAsync(subject, schema, normalizeSchemas).ConfigureAwait(continueOnCapturedContext: false)
-                        : await schemaRegistryClient.GetSchemaIdAsync(subject, schema, normalizeSchemas).ConfigureAwait(continueOnCapturedContext: false);
-                    var registeredDependentSchema = await schemaRegistryClient.LookupSchemaAsync(subject, schema, true, normalizeSchemas).ConfigureAwait(continueOnCapturedContext: false);
-                    return new SchemaReference(dependency.Name, subject, registeredDependentSchema.Version);
-                };
-                tasks.Add(t(fileDescriptor));
-            }
-            SchemaReference[] refs = await Task.WhenAll(tasks.ToArray()).ConfigureAwait(continueOnCapturedContext: false);
 
+            foreach (var fileDescriptor in fd.Dependencies)
+            {
+                if (skipKnownTypes && IgnoreReference(fileDescriptor.Name))
+                    continue;
+                
+                var lazy = cache.GetOrAdd(fileDescriptor.Name, _ =>
+                {
+                    return new Lazy<Task<SchemaReference>>(async () =>
+                    {
+                        var dependencyReferences = await RegisterOrGetReferences(fileDescriptor, context, autoRegisterSchema, skipKnownTypes, cache)
+                            .ConfigureAwait(continueOnCapturedContext: false);
+
+                        var subject = referenceSubjectNameStrategy(context, fileDescriptor.Name);
+                        var schema = new Schema(fileDescriptor.SerializedData.ToBase64(), dependencyReferences, SchemaType.Protobuf);
+
+                        if (autoRegisterSchema)
+                        {
+                            await schemaRegistryClient.RegisterSchemaAsync(subject, schema, normalizeSchemas)
+                                .ConfigureAwait(continueOnCapturedContext: false);
+                        }
+                        else
+                        {
+                            await schemaRegistryClient.GetSchemaIdAsync(subject, schema, normalizeSchemas)
+                                .ConfigureAwait(continueOnCapturedContext: false);
+                        }
+
+                        var registeredDependentSchema = await schemaRegistryClient
+                            .LookupSchemaAsync(subject, schema, true, normalizeSchemas)
+                            .ConfigureAwait(continueOnCapturedContext: false);
+
+                        return new SchemaReference(fileDescriptor.Name, subject, registeredDependentSchema.Version);
+                    }, LazyThreadSafetyMode.ExecutionAndPublication);
+                });
+
+                tasks.Add(lazy.Value);
+            }
+
+            SchemaReference[] refs = await Task.WhenAll(tasks).ConfigureAwait(continueOnCapturedContext: false);
             return refs.ToList();
         }
-
 
         /// <summary>
         ///     Serialize an instance of type <typeparamref name="T"/> to a byte array
@@ -269,7 +287,7 @@ namespace Confluent.SchemaRegistry.Serdes
                     else if (!subjectsRegistered.Contains(subject))
                     {
                         var references =
-                            await RegisterOrGetReferences(value.Descriptor.File, context, autoRegisterSchema, skipKnownTypes)
+                            await RegisterOrGetReferences(value.Descriptor.File, context, autoRegisterSchema, skipKnownTypes, new ConcurrentDictionary<string, Lazy<Task<SchemaReference>>>())
                                 .ConfigureAwait(continueOnCapturedContext: false);
 
                         // first usage: register/get schema to check compatibility

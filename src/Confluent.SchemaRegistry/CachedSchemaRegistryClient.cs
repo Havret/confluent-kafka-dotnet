@@ -24,6 +24,7 @@ using System.Threading.Tasks;
 using System.Linq;
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Threading;
 using System.Security.Cryptography.X509Certificates;
@@ -68,11 +69,14 @@ namespace Confluent.SchemaRegistry
         private int latestCacheTtlSecs;
         private readonly ConcurrentDictionary<int, Schema> schemaById = new ConcurrentDictionary<int, Schema>();
 
-        private readonly Dictionary<string /*subject*/, Dictionary<Schema, int>> idBySchemaBySubject =
-            new Dictionary<string, Dictionary<Schema, int>>();
+        private readonly ConcurrentDictionary<string /*subject*/, ConcurrentDictionary<Schema, int>> idBySchemaBySubject =
+            new ConcurrentDictionary<string, ConcurrentDictionary<Schema, int>>();
 
         private readonly Dictionary<string /*subject*/, Dictionary<int, RegisteredSchema>> schemaByVersionBySubject =
             new Dictionary<string, Dictionary<int, RegisteredSchema>>();
+        
+        private readonly ConcurrentDictionary<string /*subject*/, ConcurrentDictionary<Schema, RegisteredSchema>> registeredSchemaBySchemaBySubject =
+            new ConcurrentDictionary<string, ConcurrentDictionary<Schema, RegisteredSchema>>();
 
         private readonly MemoryCache latestVersionBySubject = new MemoryCache(new MemoryCacheOptions());
         
@@ -476,6 +480,7 @@ namespace Confluent.SchemaRegistry
                 this.schemaById.Clear();
                 this.idBySchemaBySubject.Clear();
                 this.schemaByVersionBySubject.Clear();
+                this.registeredSchemaBySchemaBySubject.Clear();
                 return true;
             }
 
@@ -512,71 +517,42 @@ namespace Confluent.SchemaRegistry
         /// <inheritdoc/>
         public async Task<int> GetSchemaIdAsync(string subject, Schema schema, bool normalize = false)
         {
-            await cacheMutex.WaitAsync().ConfigureAwait(continueOnCapturedContext: false);
-            try
+            if (!idBySchemaBySubject.ContainsKey(subject))
             {
-                if (!this.idBySchemaBySubject.TryGetValue(subject, out Dictionary<Schema, int> idBySchema))
-                {
-                    idBySchema = new Dictionary<Schema, int>();
-                    this.idBySchemaBySubject.Add(subject, idBySchema);
-                }
-
-                // TODO: The following could be optimized in the usual case where idBySchema only
-                // contains very few elements and the schema string passed in is always the same
-                // instance.
-
-                if (!idBySchema.TryGetValue(schema, out int schemaId))
-                {
-                    CleanCacheIfFull();
-
-                    // throws SchemaRegistryException if schema is not known.
-                    var registeredSchema = await restService.LookupSchemaAsync(subject, schema, true, normalize)
-                        .ConfigureAwait(continueOnCapturedContext: false);
-                    idBySchema[schema] = registeredSchema.Id;
-                    schemaById[registeredSchema.Id] = registeredSchema.Schema;
-                    schemaId = registeredSchema.Id;
-                }
-
+                CleanCacheIfFull();
+            }
+            
+            var idBySchema = idBySchemaBySubject.GetOrAdd(subject, _ => new ConcurrentDictionary<Schema, int>());
+            
+            if (idBySchema.TryGetValue(schema, out int schemaId))
+            {
                 return schemaId;
             }
-            finally
-            {
-                cacheMutex.Release();
-            }
+
+            var registeredSchema = await LookupSchemaAsync(subject, schema, true, normalize).ConfigureAwait(continueOnCapturedContext: false);
+
+            idBySchema.TryAdd(schema, registeredSchema.Id);
+            schemaById.TryAdd(registeredSchema.Id, registeredSchema.Schema);
+            
+            return registeredSchema.Id;
         }
 
 
         /// <inheritdoc/>
         public async Task<int> RegisterSchemaAsync(string subject, Schema schema, bool normalize = false)
         {
-            await cacheMutex.WaitAsync().ConfigureAwait(continueOnCapturedContext: false);
-            try
+            var idBySchema = idBySchemaBySubject.GetOrAdd(subject, _ => new ConcurrentDictionary<Schema, int>());
+
+            if (!idBySchema.TryGetValue(schema, out int schemaId))
             {
-                if (!this.idBySchemaBySubject.TryGetValue(subject, out Dictionary<Schema, int> idBySchema))
-                {
-                    idBySchema = new Dictionary<Schema, int>();
-                    this.idBySchemaBySubject[subject] = idBySchema;
-                }
+                CleanCacheIfFull();
 
-                // TODO: This could be optimized in the usual case where idBySchema only
-                // contains very few elements and the schema string passed in is always
-                // the same instance.
-
-                if (!idBySchema.TryGetValue(schema, out int schemaId))
-                {
-                    CleanCacheIfFull();
-
-                    schemaId = await restService.RegisterSchemaAsync(subject, schema, normalize)
-                        .ConfigureAwait(continueOnCapturedContext: false);
-                    idBySchema[schema] = schemaId;
-                }
-
-                return schemaId;
+                schemaId = await restService.RegisterSchemaAsync(subject, schema, normalize)
+                    .ConfigureAwait(continueOnCapturedContext: false);
+                idBySchema.TryAdd(schema, schemaId);
             }
-            finally
-            {
-                cacheMutex.Release();
-            }
+
+            return schemaId;
         }
 
 
@@ -609,9 +585,20 @@ namespace Confluent.SchemaRegistry
 
 
         /// <inheritdoc/>
-        public Task<RegisteredSchema> LookupSchemaAsync(string subject, Schema schema, bool ignoreDeletedSchemas,
+        public async Task<RegisteredSchema> LookupSchemaAsync(string subject, Schema schema, bool ignoreDeletedSchemas,
             bool normalize = false)
-            => restService.LookupSchemaAsync(subject, schema, ignoreDeletedSchemas, normalize);
+        {
+            var registeredSchemaBySchema = registeredSchemaBySchemaBySubject.GetOrAdd(subject, _ => new ConcurrentDictionary<Schema, RegisteredSchema>());
+            if (registeredSchemaBySchema.TryGetValue(schema, out RegisteredSchema registeredSchema))
+            {
+                return registeredSchema;
+            }
+            
+            registeredSchema = await restService.LookupSchemaAsync(subject, schema, ignoreDeletedSchemas, normalize).ConfigureAwait(continueOnCapturedContext: false);
+            registeredSchemaBySchema.TryAdd(schema, registeredSchema);
+            
+            return registeredSchema;
+        }
 
 
         /// <inheritdoc/>

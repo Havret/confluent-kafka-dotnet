@@ -22,6 +22,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Net;
 using Confluent.Kafka;
+using Confluent.SchemaRegistry.Serdes.Protobuf;
 using Google.Protobuf;
 using ProtobufNet::Google.Protobuf.Reflection;
 
@@ -115,10 +116,11 @@ namespace Confluent.SchemaRegistry.Serdes
         {
             if (isNull) { return null; }
 
-            var array = data.ToArray();
-            if (array.Length < 6)
+            var span = data.Span;
+
+            if (span.Length < 6)
             {
-                throw new InvalidDataException($"Expecting data framing of length 6 bytes or more but total data size is {array.Length} bytes");
+                throw new InvalidDataException($"Expecting data framing of length 6 bytes or more but total data size is {span.Length} bytes");
             }
 
             bool isKey = context.Component == MessageComponentType.Key;
@@ -137,43 +139,46 @@ namespace Confluent.SchemaRegistry.Serdes
                 Schema writerSchema = null;
                 FileDescriptorSet fdSet = null;
                 T message;
-                using (var stream = new MemoryStream(array))
-                using (var reader = new BinaryReader(stream))
+                
+                var readBytes = 0;
+                readBytes += BinaryConverter.ReadByte(span, out byte magicByte);
+                
+                if (magicByte != Constants.MagicByte)
                 {
-                    var magicByte = reader.ReadByte();
-                    if (magicByte != Constants.MagicByte)
+                    throw new InvalidDataException($"Expecting message {context.Component.ToString()} with Confluent Schema Registry framing. Magic byte was {span[0]}, expecting {Constants.MagicByte}");
+                }
+                
+                // A schema is not required to deserialize protobuf messages since the
+                // serialized data includes tag and type information, which is enough for
+                // the IMessage<T> implementation to deserialize the data (even if the
+                // schema has evolved). _schemaId is thus unused.                
+                readBytes += BinaryConverter.ReadInt32(span.Slice(readBytes), out var writerId);
+
+                // Read the index array length, then all of the indices. These are not
+                // needed, but parsing them is the easiest way to seek to the start of
+                // the serialized data because they are varints.
+                readBytes += useDeprecatedFormat
+                    ? BinaryConverter.ReadUnsignedVarint(span.Slice(readBytes), out var indicesLength)
+                    : BinaryConverter.ReadVarint(span.Slice(readBytes), out indicesLength);
+
+                for (int i = 0; i < indicesLength; ++i)
+                {
+                    if (useDeprecatedFormat)
                     {
-                        throw new InvalidDataException($"Expecting message {context.Component.ToString()} with Confluent Schema Registry framing. Magic byte was {array[0]}, expecting {Constants.MagicByte}");
+                        readBytes += BinaryConverter.ReadUnsignedVarint(span.Slice(readBytes), out _);
                     }
-
-                    // A schema is not required to deserialize protobuf messages since the
-                    // serialized data includes tag and type information, which is enough for
-                    // the IMessage<T> implementation to deserialize the data (even if the
-                    // schema has evolved). _schemaId is thus unused.
-                    var writerId = IPAddress.NetworkToHostOrder(reader.ReadInt32());
-
-                    // Read the index array length, then all of the indices. These are not
-                    // needed, but parsing them is the easiest way to seek to the start of
-                    // the serialized data because they are varints.
-                    var indicesLength = useDeprecatedFormat ? (int)stream.ReadUnsignedVarint() : stream.ReadVarint();
-                    for (int i=0; i<indicesLength; ++i)
+                    else
                     {
-                        if (useDeprecatedFormat)
-                        {
-                            stream.ReadUnsignedVarint();
-                        }
-                        else
-                        {
-                            stream.ReadVarint();
-                        }
+                        readBytes += BinaryConverter.ReadVarint(span.Slice(readBytes), out _);
                     }
+                }
+                
+                message = new T();
+                message.MergeFrom(span.Slice(readBytes));
 
-                    if (schemaRegistryClient != null)
-                    {
-                        (writerSchema, fdSet) = await GetSchema(subject, writerId);
-                    }
-
-                    message = parser.ParseFrom(stream);
+                if (schemaRegistryClient != null)
+                {
+                    (writerSchema, fdSet) = await GetSchema(subject, writerId);
                 }
 
                 if (writerSchema != null)

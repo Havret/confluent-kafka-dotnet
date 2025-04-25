@@ -22,6 +22,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <SignAssembly>true</SignAssembly>
     <AssemblyOriginatorKeyFile>Confluent.SchemaRegistry.Serdes.Protobuf.snk</AssemblyOriginatorKeyFile>
+    <LangVersion>13</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>

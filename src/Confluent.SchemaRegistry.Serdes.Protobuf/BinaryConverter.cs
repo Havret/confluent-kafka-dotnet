@@ -26,7 +26,8 @@ internal static class BinaryConverter
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int WriteInt32(Span<byte> destination, int value)
     {
-        Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(destination), BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness(value) : value);
+        Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(destination),
+            BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness(value) : value);
         return sizeof(int);
     }
 
@@ -42,5 +43,63 @@ internal static class BinaryConverter
     {
         value.CopyTo(destination);
         return value.Length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int ReadByte(ReadOnlySpan<byte> source, out byte value)
+    {
+        value = source[0];
+        return sizeof(byte);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int ReadInt32(ReadOnlySpan<byte> source, out int value)
+    {
+        value = BinaryPrimitives.ReadInt32BigEndian(source);
+        return sizeof(int);
+    }
+    
+    /// <remarks>
+    /// Inspired by: https://github.com/apache/kafka/blob/2.5/clients/src/main/java/org/apache/kafka/common/utils/ByteUtils.java#L142
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int ReadUnsignedVarint(ReadOnlySpan<byte> source, out uint value)
+    {
+        value = 0;
+        int i = 0;
+        int bytesRead = 0;
+
+        for (var index = 0; index < source.Length; index++)
+        {
+            var b = source[index];
+            bytesRead++;
+            if ((b & 0x80) == 0)
+            {
+                value |= (uint)(b << i);
+                break;
+            }
+
+            value |= (uint)((b & 0x7f) << i);
+            i += 7;
+            if (i > 28)
+            {
+                throw new OverflowException("Encoded varint is larger than uint.MaxValue");
+            }
+        }
+
+        if (bytesRead == 0)
+        {
+            throw new InvalidOperationException("Unexpected end of span reading varint.");
+        }
+
+        return bytesRead;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int ReadVarint(ReadOnlySpan<byte> source, out uint value)
+    {
+        int bytesRead = ReadUnsignedVarint(source, out var unsignedValue);
+        value = (uint)((unsignedValue >> 1) ^ -(unsignedValue & 1));
+        return bytesRead;
     }
 }
